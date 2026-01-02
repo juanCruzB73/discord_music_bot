@@ -1,13 +1,20 @@
 require("dotenv").config();
-const path = require("path");
+
 const { Client, GatewayIntentBits } = require("discord.js");
 const {
   joinVoiceChannel,
   createAudioPlayer,
   createAudioResource,
-  StreamType
+  StreamType,
+  AudioPlayerStatus
 } = require("@discordjs/voice");
 const { spawn } = require("child_process");
+
+
+let queue = [];
+let connection = null;
+let isPlaying = false;
+
 
 const client = new Client({
   intents: [
@@ -20,17 +27,61 @@ const client = new Client({
 
 const player = createAudioPlayer();
 
+
 player.on("error", (err) => {
   console.error("AudioPlayer error:", err.message);
 });
+
+player.on(AudioPlayerStatus.Idle, () => {
+  if (queue.length > 0) {
+    const next = queue.shift();
+    playUrl(next.url, next.voiceChannel, next.guild);
+  } else {
+    isPlaying = false;
+  }
+});
+
+
+function playUrl(url, voiceChannel, guild) {
+  const ytdlp = spawn("yt-dlp", [
+    "-f", "bestaudio",
+    "--no-playlist",
+    "-o", "-",
+    url
+  ]);
+
+  // 🔴 IMPORTANT: prevent crashes
+  ytdlp.on("error", (err) => {
+    console.error("yt-dlp spawn error:", err);
+  });
+
+  ytdlp.stderr.on("data", (data) => {
+    console.error("yt-dlp:", data.toString());
+  });
+
+  const resource = createAudioResource(ytdlp.stdout, {
+    inputType: StreamType.Arbitrary
+  });
+
+  if (!connection) {
+    connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: guild.id,
+      adapterCreator: guild.voiceAdapterCreator
+    });
+
+    connection.subscribe(player);
+  }
+
+  player.play(resource);
+  isPlaying = true;
+}
 
 client.once("clientReady", () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
 client.on("messageCreate", async (message) => {
-  console.log("MESSAGE:", message.content);
-
   if (message.author.bot) return;
   if (!message.content.startsWith("!")) return;
 
@@ -42,45 +93,43 @@ client.on("messageCreate", async (message) => {
     if (!url) return message.reply("y la url dowsito");
 
     const voiceChannel = message.member?.voice?.channel;
-    if (!voiceChannel) return message.reply("metete a un canal de voz tontito");
+    if (!voiceChannel)
+      return message.reply("metete a un canal de voz tontito");
 
-    try {
-      // spawn yt-dlp
-      const ytdlp = spawn("yt-dlp", [
-        "-f", "bestaudio",
-        "--no-playlist",
-        "-o", "-",
-        url
-      ]);
-
-      ytdlp.stderr.on("data", (data) => {
-        console.error("yt-dlp:", data.toString());
-      });
-
-      const resource = createAudioResource(ytdlp.stdout, {
-        inputType: StreamType.Arbitrary
-      });
-
-      const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: message.guild.id,
-        adapterCreator: message.guild.voiceAdapterCreator
-      });
-
-      connection.subscribe(player);
-      player.play(resource);
-
-      message.reply("Playing audio");
-
-    } catch (err) {
-      console.error(err);
-      message.reply("Failed to play audio");
+    if (isPlaying) {
+      queue.push({ url, voiceChannel, guild: message.guild });
+      return message.reply(`Added to queue (#${queue.length})`);
+    } else {
+      playUrl(url, voiceChannel, message.guild);
+      return message.reply("Playing audio");
     }
   }
 
-  if (command === "!stop") {
+  if (command === "!queue") {
+    if (queue.length === 0)
+      return message.reply("Queue is empty");
+
+    return message.reply(
+      queue.map((q, i) => `${i + 1}. ${q.url}`).join("\n")
+    );
+  }
+
+  if (command === "!skip") {
     player.stop();
-    message.reply("Stopped");
+    return message.reply("Skipped");
+  }
+
+  if (command === "!stop") {
+    queue = [];
+    isPlaying = false;
+    player.stop();
+
+    if (connection) {
+      connection.destroy();
+      connection = null;
+    }
+
+    return message.reply("Stopped and cleared queue");
   }
 });
 
